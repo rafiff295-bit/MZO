@@ -1,0 +1,112 @@
+name: iOS Certificate Telegram Bot & Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      action_type:
+        description: 'Action (poll_bot | build_cert)'
+        required: true
+        default: 'poll_bot'
+        type: choice
+        options:
+          - poll_bot
+          - build_cert
+      device_udid:
+        description: 'iOS Device UDID (e.g. 00008120-001C489A3E82401E)'
+        required: false
+        type: string
+      license_key:
+        description: 'License Key (e.g. IOS-9K4X-7P2M-12M)'
+        required: false
+        type: string
+      warranty_months:
+        description: 'Warranty Duration in Months (e.g. 1, 3, 6, 12)'
+        required: false
+        default: '12'
+        type: string
+      p12_password:
+        description: 'P12 Password'
+        required: false
+        default: '123456'
+        type: string
+      telegram_chat_id:
+        description: 'Telegram Chat ID to receive files'
+        required: false
+        type: string
+
+  schedule:
+    # Runs automatically every 5 minutes 24/7 on GitHub Actions
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  ios-bot-service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      # Hardcoded credentials - No GitHub Secrets needed!
+      TELEGRAM_BOT_TOKEN: "8879854980:AAHambwwMBQOa0067Y4AXEUCFJBurEra8BY"
+      OWNER_TELEGRAM_ID: "8245269289"
+      APPLE_TEAM_ID: "8X92K4L7PQ"
+      APPLE_TEAM_NAME: "NEVY PROXY Operations"
+    steps:
+      - name: Checkout Code & Keys Database
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js Runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Prepare Workspace & Permissions
+        run: |
+          mkdir -p build_artifacts data
+          chmod +x scripts/build-ios-cert.sh
+          openssl version
+
+      - name: Direct Certificate Generation (Triggered Manually)
+        if: ${{ github.event.inputs.action_type == 'build_cert' && github.event.inputs.device_udid != '' }}
+        run: |
+          UDID="${{ github.event.inputs.device_udid }}"
+          KEY="${{ github.event.inputs.license_key || 'MANUAL-KEY' }}"
+          MONTHS="${{ github.event.inputs.warranty_months || '12' }}"
+          PASS="${{ github.event.inputs.p12_password || '123456' }}"
+          ./scripts/build-ios-cert.sh "$UDID" "$KEY" "$MONTHS" "$PASS" "$APPLE_TEAM_ID" "$APPLE_TEAM_NAME"
+
+          if [ -n "${{ github.event.inputs.telegram_chat_id }}" ]; then
+            CHAT_ID="${{ github.event.inputs.telegram_chat_id }}"
+            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument" \
+              -F "chat_id=$CHAT_ID" \
+              -F "document=@build_artifacts/Cert_${UDID}.p12" \
+              -F "caption=✅ iOS Certificate (.p12)%0A📱 UDID: $UDID%0A🛡 Warranty: $MONTHS Months%0A🔐 Password: $PASS"
+
+            curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument" \
+              -F "chat_id=$CHAT_ID" \
+              -F "document=@build_artifacts/Profile_${UDID}.mobileprovision" \
+              -F "caption=📦 Provisioning Profile (.mobileprovision)%0A📱 UDID: $UDID"
+          fi
+
+      - name: Run Telegram Bot Engine (/start -> Use Key -> UDID -> OpenSSL Build)
+        if: ${{ github.event.inputs.action_type == 'poll_bot' || github.event_name == 'schedule' }}
+        run: |
+          node scripts/bot-runner.mjs
+
+      - name: Upload Built Certificates as GitHub Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-certificates-${{ github.run_number }}
+          path: build_artifacts/*
+          if-no-files-found: ignore
+
+      - name: Save Updated Keys and Database to Git Repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/keys.json || true
+          git diff --staged --quiet || (git commit -m "chore: update license keys and warranty bindings [skip ci]" && git push)
