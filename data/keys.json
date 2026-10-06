@@ -1,0 +1,28 @@
+{
+  "keys": [
+    {
+      "id": "key-1",
+      "key": "IOS-9K4X-7P2M-12M",
+      "warrantyMonths": 12,
+      "status": "unused",
+      "p12Password": "123456",
+      "udid": null
+    }
+  ],
+  "sessions": {
+    "8245269289": {
+      "step": "IDLE"
+    }
+  },
+  "settings": {
+    "customName": "ESign",
+    "apps": {
+      "gbox": false,
+      "esign": true,
+      "feather": true,
+      "ksign": false,
+      "scarlet": true
+    }
+  },
+  "lastUpdateId": 710649699
+}
