@@ -47,11 +47,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     env:
-      # Hardcoded credentials - No GitHub Secrets needed!
       TELEGRAM_BOT_TOKEN: "8879854980:AAHambwwMBQOa0067Y4AXEUCFJBurEra8BY"
       OWNER_TELEGRAM_ID: "8245269289"
       APPLE_TEAM_ID: "8X92K4L7PQ"
       APPLE_TEAM_NAME: "NEVY PROXY Operations"
+
     steps:
       - name: Checkout Code & Keys Database
         uses: actions/checkout@v4
@@ -63,11 +63,562 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Prepare Workspace & Permissions
+      - name: Auto-Generate scripts and workspace
         run: |
-          mkdir -p build_artifacts data
+          mkdir -p build_artifacts data scripts
+
+          # 1. Create OpenSSL Certificate Builder
+          cat << 'EOF' > scripts/build-ios-cert.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          UDID="${1:?Device UDID required}"
+          KEY_CODE="${2:-IOS-KEY}"
+          WARRANTY_MONTHS="${3:-12}"
+          P12_PASSWORD="${4:-123456}"
+          TEAM_ID="${5:-8X92K4L7PQ}"
+          TEAM_NAME="${6:-CertForge Operations}"
+
+          DAYS=$((WARRANTY_MONTHS * 30))
+          OUT_DIR="build_artifacts"
+          mkdir -p "$OUT_DIR"
+
+          WORK_DIR=$(mktemp -d)
+          trap 'rm -rf "$WORK_DIR"' EXIT
+
+          openssl genrsa -out "$WORK_DIR/ios_key.key" 2048 2>/dev/null
+
+          openssl req -new -x509 \
+            -key "$WORK_DIR/ios_key.key" \
+            -out "$WORK_DIR/ios_cert.crt" \
+            -days "$DAYS" \
+            -subj "/C=US/O=${TEAM_NAME}/OU=${TEAM_ID}/CN=Apple Distribution: ${TEAM_NAME} (${TEAM_ID})" \
+            -addext "basicConstraints=critical,CA:FALSE" \
+            -addext "keyUsage=critical,digitalSignature" \
+            -addext "extendedKeyUsage=critical,codeSigning"
+
+          openssl pkcs12 -export \
+            -inkey "$WORK_DIR/ios_key.key" \
+            -in "$WORK_DIR/ios_cert.crt" \
+            -name "Apple Distribution: ${TEAM_NAME} (${TEAM_ID})" \
+            -out "$OUT_DIR/Cert_${UDID}.p12" \
+            -passout "pass:${P12_PASSWORD}"
+
+          openssl x509 -in "$WORK_DIR/ios_cert.crt" -outform DER -out "$WORK_DIR/ios_cert.der"
+          CERT_B64=$(base64 -w 0 "$WORK_DIR/ios_cert.der" 2>/dev/null || base64 "$WORK_DIR/ios_cert.der" | tr -d '\n')
+
+          CREATED_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          EXPIRES_ISO=$(date -u -d "+${DAYS} days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v+"${DAYS}"d +"%Y-%m-%dT%H:%M:%SZ")
+          PROFILE_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr '[:lower:]' '[:upper:]' || uuidgen)
+
+          cat > "$WORK_DIR/profile.plist" <<PLISTEOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>AppIDName</key>
+            <string>${TEAM_NAME} Wildcard</string>
+            <key>ApplicationIdentifierPrefix</key>
+            <array><string>${TEAM_ID}</string></array>
+            <key>CreationDate</key>
+            <date>${CREATED_ISO}</date>
+            <key>Platform</key>
+            <array><string>iOS</string><string>xrOS</string></array>
+            <key>IsXcodeManaged</key>
+            <false/>
+            <key>DeveloperCertificates</key>
+            <array><data>${CERT_B64}</data></array>
+            <key>Entitlements</key>
+            <dict>
+              <key>application-identifier</key>
+              <string>${TEAM_ID}.*</string>
+              <key>keychain-access-groups</key>
+              <array><string>${TEAM_ID}.*</string></array>
+              <key>get-task-allow</key>
+              <false/>
+              <key>com.apple.developer.team-identifier</key>
+              <string>${TEAM_ID}</string>
+            </dict>
+            <key>ExpirationDate</key>
+            <date>${EXPIRES_ISO}</date>
+            <key>Name</key>
+            <string>${TEAM_NAME} AdHoc (${UDID})</string>
+            <key>ProvisionedDevices</key>
+            <array><string>${UDID}</string></array>
+            <key>TeamIdentifier</key>
+            <array><string>${TEAM_ID}</string></array>
+            <key>TeamName</key>
+            <string>${TEAM_NAME}</string>
+            <key>TimeToLive</key>
+            <integer>${DAYS}</integer>
+            <key>UUID</key>
+            <string>${PROFILE_UUID}</string>
+            <key>Version</key>
+            <integer>1</integer>
+          </dict>
+          </plist>
+          PLISTEOF
+
+          openssl cms -sign \
+            -binary -nodetach \
+            -in "$WORK_DIR/profile.plist" \
+            -signer "$WORK_DIR/ios_cert.crt" \
+            -inkey "$WORK_DIR/ios_key.key" \
+            -outform DER \
+            -out "$OUT_DIR/Profile_${UDID}.mobileprovision"
+
+          echo "✅ Built .p12 and .mobileprovision for UDID: $UDID"
+          EOF
+
           chmod +x scripts/build-ios-cert.sh
-          openssl version
+
+          # 2. Create Telegram Bot Engine
+          cat << 'EOF' > scripts/bot-runner.mjs
+          import fs from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+
+          const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8879854980:AAHambwwMBQOa0067Y4AXEUCFJBurEra8BY';
+          const OWNER_ID = String(process.env.OWNER_TELEGRAM_ID || '8245269289');
+          const TEAM_ID = process.env.APPLE_TEAM_ID || '8X92K4L7PQ';
+          const TEAM_NAME = process.env.APPLE_TEAM_NAME || 'NEVY PROXY Operations';
+          const DB_PATH = 'data/keys.json';
+
+          function loadDb() {
+            if (!fs.existsSync(DB_PATH)) {
+              fs.mkdirSync('data', { recursive: true });
+              fs.writeFileSync(
+                DB_PATH,
+                JSON.stringify(
+                  {
+                    keys: [
+                      {
+                        id: 'key-1',
+                        key: 'IOS-9K4X-7P2M-12M',
+                        warrantyMonths: 12,
+                        status: 'unused',
+                        p12Password: '123456',
+                        udid: null,
+                      },
+                    ],
+                    sessions: {},
+                    settings: {
+                      customName: 'ESign',
+                      apps: { gbox: false, esign: true, feather: true, ksign: false, scarlet: true },
+                    },
+                    lastUpdateId: 0,
+                  },
+                  null,
+                  2
+                )
+              );
+            }
+            return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+          }
+
+          function saveDb(db) {
+            fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+          }
+
+          async function tgApi(method, body) {
+            const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+            });
+            return res.json();
+          }
+
+          async function tgSendDoc(chatId, filePath, filename, caption) {
+            const fileBytes = fs.readFileSync(filePath);
+            const formData = new FormData();
+            formData.append('chat_id', String(chatId));
+            formData.append('document', new Blob([fileBytes]), filename);
+            formData.append('caption', caption);
+            formData.append('parse_mode', 'Markdown');
+
+            const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`, {
+              method: 'POST',
+              body: formData,
+            });
+            return res.json();
+          }
+
+          const welcomeKeyboard = {
+            inline_keyboard: [
+              [
+                { text: '🔍 Check UDiD', callback_data: 'CHECK_UDID' },
+                { text: '🔑 Use Key', callback_data: 'USE_KEY' },
+              ],
+              [{ text: '⚙️ Settings', callback_data: 'SETTINGS' }],
+            ],
+          };
+
+          const settingsKeyboard = {
+            inline_keyboard: [
+              [{ text: '⚙️ Customize Settings', callback_data: 'CUSTOMIZE' }],
+              [{ text: '← Back', callback_data: 'WELCOME' }],
+            ],
+          };
+
+          const customizeKeyboard = {
+            inline_keyboard: [
+              [
+                { text: '🖼 Set Thumbnail', callback_data: 'THUMBNAIL' },
+                { text: '👤 Set Custom Name', callback_data: 'NAME' },
+              ],
+              [
+                { text: '💁 Set Instructions', callback_data: 'INSTRUCTIONS' },
+                { text: '🌐 Language', callback_data: 'LANGUAGE' },
+              ],
+              [{ text: '🅰️ Applications', callback_data: 'APPLICATIONS' }],
+              [{ text: '← Back', callback_data: 'SETTINGS' }],
+            ],
+          };
+
+          function getAppsKeyboard(apps) {
+            const b = (val) => (val ? '🟢' : '🔴');
+            return {
+              inline_keyboard: [
+                [
+                  { text: `${b(apps.gbox)} GBox`, callback_data: 'TOGGLE_gbox' },
+                  { text: `${b(apps.esign)} ESign`, callback_data: 'TOGGLE_esign' },
+                  { text: `${b(apps.feather)} Feather`, callback_data: 'TOGGLE_feather' },
+                ],
+                [
+                  { text: `${b(apps.ksign)} Ksign`, callback_data: 'TOGGLE_ksign' },
+                  { text: `${b(apps.scarlet)} Scarlet`, callback_data: 'TOGGLE_scarlet' },
+                ],
+                [{ text: '← Back', callback_data: 'CUSTOMIZE' }],
+              ],
+            };
+          }
+
+          async function handleUpdate(update, db) {
+            if (update.callback_query) {
+              const cb = update.callback_query;
+              const chatId = String(cb.message.chat.id);
+              const data = cb.data;
+              await tgApi('answerCallbackQuery', { callback_query_id: cb.id });
+
+              if (data === 'WELCOME') {
+                db.sessions[chatId] = { step: 'IDLE' };
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: '👋 *Welcome!*',
+                  parse_mode: 'Markdown',
+                  reply_markup: welcomeKeyboard,
+                });
+                return;
+              }
+
+              if (data === 'SETTINGS') {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text:
+                    '⚙️ *Settings:*\n\n' +
+                    '— 🧬 Generate Keys 1-100\n' +
+                    '— 🔒 Transfer Balance\n' +
+                    '— 🧬 Set up API key\n' +
+                    '— 🖼 Customize Settings\n' +
+                    '—  Choose which apps to sign',
+                  parse_mode: 'Markdown',
+                  reply_markup: settingsKeyboard,
+                });
+                return;
+              }
+
+              if (data === 'CUSTOMIZE') {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: '*Customize your account settings.*',
+                  parse_mode: 'Markdown',
+                  reply_markup: customizeKeyboard,
+                });
+                return;
+              }
+
+              if (data === 'APPLICATIONS') {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: '*Toggle applications on/off. Enabled apps will be signed when a certificate is issued.*',
+                  parse_mode: 'Markdown',
+                  reply_markup: getAppsKeyboard(db.settings.apps),
+                });
+                return;
+              }
+
+              if (data.startsWith('TOGGLE_')) {
+                const app = data.replace('TOGGLE_', '');
+                if (app in db.settings.apps) {
+                  db.settings.apps[app] = !db.settings.apps[app];
+                  if (cb.message?.message_id) {
+                    await tgApi('editMessageReplyMarkup', {
+                      chat_id: chatId,
+                      message_id: cb.message.message_id,
+                      reply_markup: getAppsKeyboard(db.settings.apps),
+                    });
+                  }
+                }
+                return;
+              }
+
+              if (data === 'USE_KEY') {
+                db.sessions[chatId] = { step: 'AWAITING_KEY' };
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: '🔑 *Send Key*\n\nPlease paste your License Key created by the Owner:',
+                  parse_mode: 'Markdown',
+                });
+                return;
+              }
+
+              if (data === 'CHECK_UDID') {
+                db.sessions[chatId] = { step: 'AWAITING_CHECK' };
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: '🔍 *Check UDiD*\n\nSend your iOS UDID or License Key to check warranty status:',
+                  parse_mode: 'Markdown',
+                });
+                return;
+              }
+            }
+
+            const msg = update.message;
+            if (!msg || !msg.text) return;
+            const chatId = String(msg.chat.id);
+            const text = msg.text.trim();
+            const session = db.sessions[chatId] || { step: 'IDLE' };
+
+            if (text === '/start') {
+              db.sessions[chatId] = { step: 'IDLE' };
+              await tgApi('sendMessage', {
+                chat_id: chatId,
+                text: '👋 *Welcome!*',
+                parse_mode: 'Markdown',
+                reply_markup: welcomeKeyboard,
+              });
+              return;
+            }
+
+            // Owner commands
+            if (chatId === OWNER_ID) {
+              if (text.startsWith('/genkey')) {
+                const parts = text.split(/\s+/);
+                const months = parseInt(parts[1] || '12', 10);
+                const count = parseInt(parts[2] || '1', 10);
+                const generated = [];
+
+                for (let i = 0; i < count; i++) {
+                  const seg = () => Math.random().toString(36).substring(2, 6).toUpperCase();
+                  const k = `IOS-${seg()}-${seg()}-${String(months).padStart(2, '0')}M`;
+                  db.keys.unshift({
+                    key: k,
+                    warrantyMonths: months,
+                    status: 'unused',
+                    p12Password: '123456',
+                    udid: null,
+                    createdAt: new Date().toISOString(),
+                  });
+                  generated.push(k);
+                }
+
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text:
+                    `✅ *Owner Panel: ${count} Keys Created!*\n🛡 Warranty: *${months} Months*\n\n` +
+                    generated.map((k) => `🔑 \`${k}\``).join('\n'),
+                  parse_mode: 'Markdown',
+                });
+                return;
+              }
+
+              if (text.startsWith('/editwarranty')) {
+                const parts = text.split(/\s+/);
+                const targetKey = parts[1];
+                const newMonths = parseInt(parts[2] || '12', 10);
+                const found = db.keys.find((k) => k.key.toUpperCase() === (targetKey || '').toUpperCase());
+
+                if (!found) {
+                  await tgApi('sendMessage', { chat_id: chatId, text: '❌ Key not found.' });
+                  return;
+                }
+
+                found.warrantyMonths = newMonths;
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `✅ *Warranty Updated!*\n🔑 Key: \`${found.key}\`\n🛡 New Warranty: *${newMonths} Months*`,
+                  parse_mode: 'Markdown',
+                });
+                return;
+              }
+            }
+
+            // Check UDID
+            if (session.step === 'AWAITING_CHECK') {
+              db.sessions[chatId] = { step: 'IDLE' };
+              const query = text.toUpperCase();
+              const found = db.keys.find((k) => k.key.toUpperCase() === query || (k.udid && k.udid.toUpperCase() === query));
+
+              if (!found) {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `❌ No record found for "${text}".`,
+                  reply_markup: welcomeKeyboard,
+                });
+              } else {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text:
+                    `🔍 *Certificate & Warranty Status:*\n\n` +
+                    `🔑 Key: \`${found.key}\`\n` +
+                    `📱 UDID: \`${found.udid || 'Not activated yet'}\`\n` +
+                    `🛡 Warranty: *${found.warrantyMonths} Months* (${found.status.toUpperCase()})\n` +
+                    `🔐 Password: \`${found.p12Password || '123456'}\``,
+                  parse_mode: 'Markdown',
+                  reply_markup: welcomeKeyboard,
+                });
+              }
+              return;
+            }
+
+            // Step 1: User sends Key
+            const matchedKey = db.keys.find((k) => k.key.toUpperCase() === text.toUpperCase());
+            if (session.step === 'AWAITING_KEY' || matchedKey) {
+              if (!matchedKey) {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: '❌ *Invalid Key.* Please send a valid Key from the Owner:',
+                  parse_mode: 'Markdown',
+                });
+                return;
+              }
+
+              if (matchedKey.status === 'used' && matchedKey.udid) {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `ℹ️ Key already activated on UDID: \`${matchedKey.udid}\` (Warranty: ${matchedKey.warrantyMonths} Months)`,
+                  parse_mode: 'Markdown',
+                });
+                return;
+              }
+
+              db.sessions[chatId] = { step: 'AWAITING_UDID', activeKey: matchedKey.key };
+              await tgApi('sendMessage', {
+                chat_id: chatId,
+                text:
+                  `✅ *Key Verified!* (Warranty: *${matchedKey.warrantyMonths} Months*)\n\n` +
+                  `📱 *Now send your iOS Device UDID* (e.g. \`00008120-001C489A3E82401E\`):`,
+                parse_mode: 'Markdown',
+              });
+              return;
+            }
+
+            // Step 2: User sends Device UDID -> Build & Deliver
+            if (session.step === 'AWAITING_UDID' && session.activeKey) {
+              const cleanUdid = text.replace(/[^a-zA-Z0-9-]/g, '').toUpperCase();
+              if (cleanUdid.length < 16) {
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: '⚠️ Invalid UDID. Please send a valid 24-40 character iOS UDID:',
+                });
+                return;
+              }
+
+              const keyObj = db.keys.find((k) => k.key === session.activeKey);
+              if (!keyObj) return;
+
+              await tgApi('sendMessage', {
+                chat_id: chatId,
+                text: `⚙️ *Generating Certificate with OpenSSL (${keyObj.warrantyMonths} Months Warranty)...*`,
+                parse_mode: 'Markdown',
+              });
+
+              try {
+                execFileSync('./scripts/build-ios-cert.sh', [
+                  cleanUdid,
+                  keyObj.key,
+                  String(keyObj.warrantyMonths),
+                  keyObj.p12Password || '123456',
+                  TEAM_ID,
+                  TEAM_NAME,
+                ]);
+
+                keyObj.status = 'used';
+                keyObj.udid = cleanUdid;
+                keyObj.redeemedAt = new Date().toISOString();
+                db.sessions[chatId] = { step: 'IDLE' };
+
+                await tgSendDoc(
+                  chatId,
+                  `build_artifacts/Cert_${cleanUdid}.p12`,
+                  `Cert_${cleanUdid}.p12`,
+                  `✅ *iOS Certificate (.p12)*\n🔑 Key: \`${keyObj.key}\`\n📱 UDID: \`${cleanUdid}\`\n🛡 Warranty: *${keyObj.warrantyMonths} Months*\n🔐 Password: \`${keyObj.p12Password || '123456'}\``
+                );
+
+                await tgSendDoc(
+                  chatId,
+                  `build_artifacts/Profile_${cleanUdid}.mobileprovision`,
+                  `Profile_${cleanUdid}.mobileprovision`,
+                  `📦 *Mobile Provisioning Profile (.mobileprovision)*\n📱 UDID: \`${cleanUdid}\`\n🏢 Team: \`${TEAM_ID}\``
+                );
+
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text:
+                    `🎉 *Certificate Created & Signed Successfully!*\n\n` +
+                    `• Certificate: \`.p12\` (RSA 2048-bit)\n` +
+                    `• Profile: \`.mobileprovision\` (CMS signed)\n` +
+                    `• Password: \`${keyObj.p12Password || '123456'}\`\n` +
+                    `• Device UDID: \`${cleanUdid}\`\n` +
+                    `• Warranty: *${keyObj.warrantyMonths} Months*\n\n` +
+                    `Ready to import into ESign, Feather, Scarlet, or TrollStore!`,
+                  parse_mode: 'Markdown',
+                  reply_markup: welcomeKeyboard,
+                });
+              } catch (err) {
+                console.error('Error generating cert:', err);
+                await tgApi('sendMessage', {
+                  chat_id: chatId,
+                  text: `❌ Error creating certificate: ${err.message}`,
+                });
+              }
+            }
+          }
+
+          async function main() {
+            const db = loadDb();
+            const startTime = Date.now();
+            const maxRunTime = 280 * 1000;
+
+            while (Date.now() - startTime < maxRunTime) {
+              try {
+                const res = await tgApi('getUpdates', {
+                  offset: (db.lastUpdateId || 0) + 1,
+                  timeout: 10,
+                });
+
+                if (res.ok && Array.isArray(res.result) && res.result.length > 0) {
+                  for (const update of res.result) {
+                    db.lastUpdateId = Math.max(db.lastUpdateId || 0, update.update_id);
+                    await handleUpdate(update, db);
+                  }
+                  saveDb(db);
+                }
+              } catch (e) {
+                await new Promise((r) => setTimeout(r, 3000));
+              }
+            }
+
+            saveDb(db);
+          }
+
+          main().catch(console.error);
+          EOF
+
+      - name: Run Telegram Bot Engine (/start -> Use Key -> UDID -> OpenSSL Build)
+        if: ${{ github.event.inputs.action_type == 'poll_bot' || github.event_name == 'schedule' }}
+        run: |
+          node scripts/bot-runner.mjs
 
       - name: Direct Certificate Generation (Triggered Manually)
         if: ${{ github.event.inputs.action_type == 'build_cert' && github.event.inputs.device_udid != '' }}
@@ -90,11 +641,6 @@ jobs:
               -F "document=@build_artifacts/Profile_${UDID}.mobileprovision" \
               -F "caption=📦 Provisioning Profile (.mobileprovision)%0A📱 UDID: $UDID"
           fi
-
-      - name: Run Telegram Bot Engine (/start -> Use Key -> UDID -> OpenSSL Build)
-        if: ${{ github.event.inputs.action_type == 'poll_bot' || github.event_name == 'schedule' }}
-        run: |
-          node scripts/bot-runner.mjs
 
       - name: Upload Built Certificates as GitHub Artifacts
         if: always()
